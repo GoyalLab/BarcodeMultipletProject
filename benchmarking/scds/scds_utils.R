@@ -1,0 +1,127 @@
+run_hybrid_on_dataset <- function(data_dir, METHOD_ID, dbl_exp, dbl_act, num_to_test=5) {
+  print(glue("Working on dataset: {data_dir}"))
+  dir_10X <- glue("{data_dir}/10X")
+  dataset_id <- strsplit(data_dir, "/")[[1]][[length(strsplit(data_dir, "/")[[1]])]]
+  sample_dirs <- list.dirs(path = dir_10X, full.names = TRUE, recursive = F)
+  stats <- list()
+  out_df <- NULL
+  labels_prefix <- glue("{data_dir}/fatemapID/{dataset_id}")
+  for (cur_sample_dir in sample_dirs) {
+    cur_sample_id <- strsplit(cur_sample_dir, "/")[[1]][[length(strsplit(cur_sample_dir, "/")[[1]])]]
+    cur_data_sample_id <- glue("{dataset_id}_{cur_sample_id}")
+    cur_df <- run_bchmk(cur_sample_dir = cur_sample_dir, labels_prefix = labels_prefix, dbl_act = dbl_act,
+                        data_sample_ID = cur_data_sample_id, num_to_test = num_to_test, dbl_exp = dbl_exp)
+    out_df <- rbindlist(list(out_df, cur_df))|>
+      data.frame()
+  }
+  # out_df <- out_df[order(out_df$Expected_Doublet_Rate),]
+  out_df
+}
+
+run_bchmk_original_paper <- function(bchmk_dataset_path, num_to_test){
+  df_ls <- NULL
+  for(i in 1:num_to_test){
+    cur_data<-readRDS(bchmk_dataset_path)
+    cur_data_id<-strsplit(bchmk_dataset_path, "/")[[1]][[8]]
+    count<-cur_data[[1]]
+    label<-cur_data[[2]]
+    doublet.seurat <- CreateSeuratObject(counts = count, min.cells = 1)
+    doublet.seurat <- AddMetaData(doublet.seurat, col.name="label", label)
+    cur_exp_dbl<-sum(label=="doublet")/length(label)
+    print(glue("INFO: Current benchmark dataset doublet rate is: {cur_exp_dbl}"))
+    sce <- as.SingleCellExperiment(doublet.seurat)
+    cur_res <- run_cxds(sce, exp_dbl = cur_exp_dbl)
+    df_ls <- rbindlist(list(df_ls, cur_res))
+  }
+  all_stats <- data.frame(df_ls)
+  all_stats <- cbind(ID = rep(cur_data_id, nrow(all_stats)), all_stats)
+  all_stats
+}
+
+run_bchmk <- function(cur_sample_dir, labels_prefix, dbl_act, data_sample_ID, num_to_test, dbl_exp) {
+  df_ls <- NULL
+  for (idx in 1:num_to_test) {
+    sce <- load_fatemap_into_sce(cur_sample_dir, labels_prefix, doublets_pct=dbl_act)
+    cur_res <- run_cxds(sce, exp_dbl = dbl_exp)
+    df_ls <- rbindlist(list(df_ls, cur_res))
+
+  }
+  all_stats <- data.frame(df_ls)
+  all_stats <- cbind(ID = rep(data_sample_ID, nrow(all_stats)), all_stats)
+  all_stats
+}
+
+run_cxds <- function(sce, exp_dbl) {
+  n_exp_dbl <- round(dim(sce)[2]*exp_dbl)
+  sce <- cxds_bcds_hybrid(sce, estNdbl = n_exp_dbl, force=T)
+
+  score <- colData(sce)
+  fg <- score[score$label=="doublet",][["hybrid_score"]]
+  bg <- score[score$label=="singlet",][["hybrid_score"]]
+  pr <- pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+  cur_pr<-pr$auc.integral
+  roc <- roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+  cur_roc<-roc$auc
+  output<-list(
+    "roc"=cur_roc,
+    "pr"=cur_pr
+  )
+}
+
+load_fatemap_into_sce <- function(data_dir, cell_labels_prefix, doublets_pct = 0.08) {
+  doublet.seurat <- load_fatemap_into_seurat(data_dir = data_dir, cell_labels_prefix =
+    cell_labels_prefix, doublets_pct = doublets_pct)
+  sce <- as.SingleCellExperiment(doublet.seurat)
+  sce
+}
+
+load_fatemap_into_seurat <- function(data_dir, cell_labels_prefix, doublets_pct = 0.08) {
+  expression_matrix <- Read10X(data.dir = data_dir)
+  seurat_object <- CreateSeuratObject(counts = expression_matrix)
+  singlets_file <- glue("{cell_labels_prefix}_singlets.txt")
+
+  # key file for simulaitng doublets
+  singlets_pair_for_doublet_simulation_file <- list.files(data_dir, pattern = "corrected_singlet_pairs.csv")
+
+  # extract the singlets
+  singlets_pair_for_doublet_simulation_file <- glue("{data_dir}/{singlets_pair_for_doublet_simulation_file}")
+  singlets <- read.delim(singlets_file, header = F, sep = "\n")[, 1]|>
+    as.vector()|>
+    paste("-1", sep = "")
+
+  # extract the singlet paris
+  singlet_pair_df <- read.csv(singlets_pair_for_doublet_simulation_file, header = F)|>
+    dplyr::mutate_each(funs = function(x) str_remove_all(x, " "))
+  # remove combinations that did not pass QC in seurat
+  all_seurat_cells <- seurat_object@meta.data|>row.names()
+
+  # take average of expression to produce doublets
+  real_cells_pt1 <- singlet_pair_df$V1
+  real_cells_pt2 <- singlet_pair_df$V2
+  assay_for_simulated_doublets <- seurat_object@assays$RNA@counts[, c(real_cells_pt1, real_cells_pt2)]
+  avg_assay <- (assay_for_simulated_doublets[, real_cells_pt1] + assay_for_simulated_doublets[, real_cells_pt2]) / 2
+
+
+  # create artificial doublet ID
+  singlets_in_seurat <- singlets[singlets %in% colnames(seurat_object)]
+  doublet_id <- paste(singlet_pair_df$V1, singlet_pair_df$V2, sep = "--")
+  colnames(avg_assay) <- doublet_id
+  num_doublets <- round(length(singlets_in_seurat) * doublets_pct / (1 - doublets_pct))
+  avg_assay <- avg_assay[, 1:num_doublets]
+  doublet_object <- CreateSeuratObject(counts = avg_assay)
+
+  # tag doublet labels back to the doublet object
+  label <- rep("doublet", ncol(doublet_object))|>
+    as.data.frame()
+  rownames(label) <- colnames(doublet_object)
+  doublet_object <- AddMetaData(doublet_object, label, col.name = "label")
+
+  # merge the two objects
+  singlet_object <- seurat_object[, singlets_in_seurat]
+  label <- rep("singlet", ncol(singlet_object))|>
+    as.data.frame()
+  rownames(label) <- colnames(singlet_object)
+  singlet_object <- AddMetaData(singlet_object, label, col.name = "label")
+  doublet.seurat <- merge(singlet_object, y = doublet_object, project = "combined_doublet_singlet")
+  doublet.seurat
+}
